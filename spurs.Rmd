@@ -1,0 +1,382 @@
+---
+title: "Soccer DataScience"
+author: "Kasper"
+date: "2023-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(RSQLite)
+
+filename <- "your_db_file.db"
+sqlite.driver <- dbDriver("SQLite")
+db <- dbConnect(sqlite.driver,
+                dbname = filename)
+                
+## Some operations
+dbListTables(db)
+mytable <- dbReadTable(db,"your_table_name")
+```
+
+
+```{r}
+pacman::p_load(tidyverse, BiocManager, DBI, dplyr, tsibble, feasts, fpp3)
+
+
+con <- dbConnect(SQLite(), dbname="database.sqlite")
+
+# list all tables
+dbListTables(con)
+```
+
+```{r}
+matches_df <- dbReadTable(con, "Match")
+team_df <- dbReadTable(con, "Team")
+league_df <- dbReadTable(con, "League")
+player_df <- dbReadTable(con, "Player")
+attributes_df <- dbReadTable(con, "Team_Attributes")
+```
+
+```{r}
+prem_df <- subset(matches_df, league_id == 1729)
+
+spurs_df <- prem_df[prem_df$home_team_api_id == 8586 | prem_df$away_team_api_id == 8586, ]
+
+spurs_df$spurs_goals <- c()
+spurs_df$goaldiff <- c()
+
+for (i in 1:nrow(spurs_df)){
+  if (spurs_df$home_team_api_id[i] == 8586){
+    spurs_df$spurs_goals[i] <- spurs_df$home_team_goal[i]
+    spurs_df$goaldiff[i] <- spurs_df$home_team_goal[i]-spurs_df$away_team_goal[i]
+  }
+  else if (spurs_df$away_team_api_id[i] == 8586){
+    spurs_df$spurs_goals[i] <- spurs_df$away_team_goal[i]
+    spurs_df$goaldiff[i] <- spurs_df$away_team_goal[i]-spurs_df$home_team_goal[i] 
+  }
+}
+
+
+```
+
+```{r}
+pacman::p_load(feasts)
+spurs_df$date <- as.Date(spurs_df$date)
+spurs_df <- mutate(spurs_df$date = yearweek(spurs_df$date))
+spurs_df <- tsibble(spurs_df,
+                    index = date)
+
+autoplot(spurs_df, goaldiff)
+str(spurs_df)
+
+spurs_df$gamenumber <- 1:304
+spursdf <- tsibble(spurs_df,
+                   index = gamenumber)
+
+autoplot(spursdf, goaldiff)
+
+newspurs %>% 
+  gg_season(goaldiff, period = "year", labels = "both") +
+  labs(y = "goals",
+       title = "goaldiff")
+
+newspurs <- tsibble::fill_gaps(spurs_df)
+newspurs$goaldiff <- newspurs$goaldiff %>% replace_na(0)
+
+newspurs %>% 
+  gg_subseries(goaldiff, period = "day") +
+  labs(y = "goals",
+       title = "goaldiff")
+
+```
+
+```{r}
+spursnewest <- spurs_df %>% select(id, league_id, season, stage, date, match_api_id, home_team_api_id, away_team_api_id, home_team_goal, away_team_goal, spurs_goals, goaldiff, gamenumber)
+spursnewest$home <- 0
+for (i in 1:nrow(spursnewest)){
+  if (spursnewest$home_team_api_id[i] == 8586){
+    spursnewest$home[i] <- 1
+  }
+  else {
+    spursnewest$home[i] <- 0
+  }
+}
+
+spursnewest$spurs_opp <- 0
+for (i in 1:nrow(spursnewest)){
+  if (spursnewest$home_team_api_id[i] != 8586) {
+    for (j in 1:nrow(team_df)){
+      if (spursnewest$home_team_api_id[i]==team_df$team_api_id[j]){
+        spursnewest$spurs_opp[i] <- team_df$team_long_name[j]
+      }
+    }
+  }
+}
+
+for (i in 1:nrow(spursnewest)){
+  if (spursnewest$away_team_api_id[i] != 8586) {
+    for (j in 1:nrow(team_df)){
+      if (spursnewest$away_team_api_id[i]==team_df$team_api_id[j]){
+        spursnewest$spurs_opp[i] <- team_df$team_long_name[j]
+      }
+    }
+  }
+}
+
+write_csv(spursnewest, file = "spurs.csv")
+```
+
+
+##Arima modelling
+```{r}
+pacman::p_load(fable, urca)
+autoplot(spursdf, goaldiff)
+
+spursdf %>% gg_tsdisplay(difference(goaldiff), plot_type='partial')
+
+ARIMA_models <- spursdf %>% model(arima210 = ARIMA(goaldiff ~ 0 + pdq(2,1,0)),
+                  arima013 = ARIMA(goaldiff ~ 0 + pdq(0,1,3)),
+                  stepwise = ARIMA(goaldiff),
+                  search = ARIMA(goaldiff, stepwise=FALSE))
+
+glance(ARIMA_models) %>%  arrange(AICc) |> select(.model:BIC)
+
+ARIMA_models %>% select(search) %>% gg_tsresiduals()
+
+ARIMA_models %>% forecast(h=5) %>%  filter(.model=='search') %>% autoplot(spursdf)
+```
+
+```{r}
+edited_spurs <- read_csv("spurs_edit.csv")
+
+#Creating new variables 
+edited_spurs$off_adv <- edited_spurs$spurs_attack - edited_spurs$opp_defense
+edited_spurs$def_adv <- edited_spurs$spurs_def - edited_spurs$opp_attack
+edited_spurs$rate_diff <- edited_spurs$spurs_rating - edited_spurs$opp_rating
+
+edited_spurs$win <- 0
+edited_spurs$draw <- 0
+edited_spurs$loss <- 0
+
+for (i in 1:nrow(edited_spurs)){
+  if (edited_spurs$goaldiff[i] > 0){
+    edited_spurs$win[i] <- 1 
+  }
+}
+
+for (i in 1:nrow(edited_spurs)){
+  if (edited_spurs$goaldiff[i] == 0){
+    edited_spurs$draw[i] <- 1 
+  }
+}
+
+for (i in 1:nrow(edited_spurs)){
+  if (edited_spurs$goaldiff[i] < 0){
+    edited_spurs$loss[i] <- 1 
+  }
+}
+
+edited_spurs$total_goals <- 0
+for (i in 1:nrow(edited_spurs)){
+  edited_spurs$total_goals[i] <- edited_spurs$home_team_goal[i] + edited_spurs$away_team_goal[i]
+}
+
+edited_spurs$plus_two_goals <- 0
+for (i in 1:nrow(edited_spurs)){
+  if (edited_spurs$total_goals[i] > 2){
+    edited_spurs$plus_two_goals[i] <- 1
+  }
+}
+
+edited_spurs$form <- 0
+
+for (i in 1:303){
+  if (i==39 || i==77 || i==115 || i==153 || i==191 || i==229 || i==267){
+    edited_spurs$form[i] <- 0
+  }
+  else if (edited_spurs$win[i]==1 && edited_spurs$rate_diff[i] > 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + 1
+  }
+  else if (edited_spurs$draw[i]==1 && edited_spurs$rate_diff[i] > 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + -1
+  }
+  else if (edited_spurs$loss[i]==1 && edited_spurs$rate_diff[i] > 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + -3
+  }
+  else if (edited_spurs$win[i]==1 && edited_spurs$rate_diff[i] < 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + 3
+  }
+  else if (edited_spurs$loss[i]==1 && edited_spurs$rate_diff[i] < 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + -1
+  }
+  else if (edited_spurs$draw[i]==1 && edited_spurs$rate_diff[i] < 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + 1
+  }
+  else if (edited_spurs$win[i]==1 && edited_spurs$rate_diff[i] == 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + 2
+  }
+  else if (edited_spurs$loss[i]==1 && edited_spurs$rate_diff[i] == 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + -2
+  }
+  else if (edited_spurs$draw[i]==1 && edited_spurs$rate_diff[i] == 0){
+    edited_spurs$form[i+1] <- edited_spurs$form[i] + 0
+  }
+}
+
+edited_spurs1 <- as_tsibble(edited_spurs, index = date)
+edited_spurs <- as_tsibble(edited_spurs, index = gamenumber)
+```
+
+```{r}
+#Significant effect
+m1 <- edited_spurs %>% model(lm = TSLM(win ~ home + rate_diff))
+report(m1)
+
+#No significant effect
+m2 <- edited_spurs %>% model(lm = TSLM(draw ~ home + rate_diff))
+report(m2)
+
+m3 <- edited_spurs %>% model(lm = TSLM(loss ~ home + rate_diff))
+report(m3)
+
+m4 <- edited_spurs %>% model(lm = TSLM(goaldiff ~ home + rate_diff))
+forecast_m4 <- forecast(m4, new_data = edited_spurs)
+forecast_m4 %>% autoplot(edited_spurs)
+
+# Assuming `edited_spurs` contains historical data and you want to predict future data
+trainingdata <- edited_spurs %>% slice_head(n = 266)
+future_data <- edited_spurs %>% 
+  slice_tail(n = 38)  # Example: Predicting the next 10 time periods
+
+m4 <- trainingdata %>% model(lm = TSLM(goaldiff ~ home + rate_diff))
+forecast_test <- m4 %>% forecast(new_data = future_data) 
+forecast_test %>% autoplot(trainingdata)
+accuracy <- forecast_test %>% accuracy(future_data)
+
+#forecast(new_data = edited_spurs) %>% autoplot(edited_spurs)
+
+m5 <- edited_spurs %>% model(lm = TSLM(goaldiff ~ rate_diff))
+report(m5)
+
+m6 <- edited_spurs %>% model(lm = TSLM(plus_two_goals ~ off_adv + home))
+report(m5)
+```
+
+
+```{r}
+str(spursmodel)
+#Cross validation
+spursmodel <- edited_spurs %>% 
+  stretch_tsibble(.init = 250, .step = 1) %>% filter(.id != max(.id)) %>% 
+  relocate(gamenumber, .id)
+
+str(spursmodel)
+# TSCV accuracy
+m10 <- spursmodel %>% model(lm = TSLM(goaldiff ~ rate_diff))
+hi <- spursmodel %>% 
+  model(lm = TSLM(goaldiff ~ home)) 
+  
+forecast(m10, spursmodel) %>% accuracy(edited_spurs)
+forecast(m5, edited_spurs) %>% accuracy(edited_spurs)
+# Training set accuracy
+edited_spurs %>% 
+  model(lm = TSLM(goaldiff ~ home)) %>% 
+  accuracy(edited_spurs)
+```
+
+```{r}
+edited_spurs1 <- fill_gaps(edited_spurs1)
+edited_spurs %>% gg_season(goaldiff, period = )
+
+ggplot(edited_spurs, aes(x = stage, y = 1)) +
+  gg_season() +
+  labs(title = "Seasonality of Football Matches")
+
+# Assuming your dataframe is named "football_data" with an 'stage' index column
+edited_spurs$dato <- as.Date((edited_spurs$stage - 1) * 7, origin = "2022-08-01")
+
+# Plotting the seasonality using gg_season
+gg_season(edited_spurs, period = "month")
+
+edited_spurs1 %>% 
+  gg_subseries(total_goals, period = "week") +
+  labs(y = "goals",
+       title = "goaldiff")
+
+#edited_spurs1 <- tsibble::fill_gaps(spurs_df)
+edited_spurs1$goaldiff <- edited_spurs1$goaldiff %>% replace_na(0)
+edited_spurs1$total_goals <- edited_spurs1$total_goals %>% replace_na(0)
+
+edited_spurs1 %>% 
+  gg_season(goaldiff, period = "year", labels = "both") +
+  labs(y = "goals",
+       title = "goaldiff")
+
+edited_spurs1 %>% 
+  gg_season(total_goals, period = "year", labels = "both") +
+  labs(y = "goals",
+       title = "goaldiff")
+```
+
+```{r}
+# Add a grouping variable
+edited_spurs$group <- rep(1:8, each = 38)
+
+# Plotting the time series
+ggplot(edited_spurs, aes(x = 1:304, y = goaldiff, group = group)) +
+  geom_line() +
+  labs(title = "Time Series Plot",
+       x = "Stage",
+       y = "Value")
+
+edited_spurs$group <- rep(1:8, each = 304/8)
+
+# Create a subset of data for plotting
+subset_data <- subset(edited_spurs, stage <= 38)  # Modify this condition to specify the desired subset range
+
+# Plotting the time series subset
+ggplot(subset_data, aes(x = stage, y = goaldiff, group = group, color = as.factor(group))) +
+  geom_line() +
+  labs(title = "Time Series Plot",
+       x = "Stage",
+       y = "goal difference")
+
+# Plotting the time series subset
+ggplot(subset_data, aes(x = stage, y = total_goals, group = group, color = as.factor(group))) +
+  geom_line() +
+  labs(title = "Time Series Plot",
+       x = "Stage",
+       y = "goal difference")
+
+# Plotting the time series subset
+# ggplot(subset_data, aes(x = stage, y = draw, group = group, color = as.factor(group))) +
+#   geom_line() +
+#   labs(title = "Time Series Plot",
+#        x = "Stage",
+#        y = "goal difference")
+```
+
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
